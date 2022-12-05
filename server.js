@@ -1,9 +1,16 @@
 const mongoClient = require('mongodb').MongoClient;
 const mongoObjectID = require('mongodb').ObjectID;
+const redis = require('redis');
 const bodyParser = require('body-parser');
 const express = require('express');
 const pino = require('pino');
 const expPino = require('express-pino-logger');
+
+// MongoDB
+var db;
+var usersCollection;
+var ordersCollection;
+var mongoConnected = false;
 
 const logger = pino({
     level: 'info',
@@ -12,12 +19,8 @@ const logger = pino({
 });
 const expLogger = expPino({
     logger: logger
-});
 
-// MongoDB
-var db;
-var collection;
-var mongoConnected = false;
+});
 
 const app = express();
 
@@ -40,53 +43,109 @@ app.get('/health', (req, res) => {
     res.json(stat);
 });
 
-// all products
-app.get('/products', (req, res) => {
+// use REDIS INCR to track anonymous users
+app.get('/uniqueid', (req, res) => {
+    // get number from Redis
+    redisClient.incr('anonymous-counter', (err, r) => {
+        if(!err) {
+            res.json({
+                uuid: 'anonymous-' + r
+            });
+        } else {
+            req.log.error('ERROR', err);
+            res.status(500).send(err);
+        }
+    });
+});
+
+// check user exists
+app.get('/check/:id', (req, res) => {
     if(mongoConnected) {
-        collection.find({}).toArray().then((products) => {
-            res.json(products);
+        usersCollection.findOne({name: req.params.id}).then((user) => {
+            if(user) {
+                res.send('OK');
+            } else {
+                res.status(404).send('user not found');
+            }
+        }).catch((e) => {
+            req.log.error(e);
+            res.send(500).send(e);
+        });
+    } else {
+        req.log.error('database not available');
+        res.status(500).send('database not available');
+    }
+});
+
+// return all users for debugging only
+app.get('/users', (req, res) => {
+    if(mongoConnected) {
+        usersCollection.find().toArray().then((users) => {
+            res.json(users);
         }).catch((e) => {
             req.log.error('ERROR', e);
             res.status(500).send(e);
         });
     } else {
         req.log.error('database not available');
-        res.status(500).send('database not avaiable');
+        res.status(500).send('database not available');
     }
 });
 
-// product by SKU
-app.get('/product/:sku', (req, res) => {
-    if(mongoConnected) {
-        // optionally slow this down
-        const delay = process.env.GO_SLOW || 0;
-        setTimeout(() => {
-        collection.findOne({sku: req.params.sku}).then((product) => {
-            req.log.info('product', product);
-            if(product) {
-                res.json(product);
+app.post('/login', (req, res) => {
+    req.log.info('login', req.body);
+    if(req.body.name === undefined || req.body.password === undefined) {
+        req.log.warn('credentails not complete');
+        res.status(400).send('name or passowrd not supplied');
+    } else if(mongoConnected) {
+        usersCollection.findOne({
+            name: req.body.name,
+        }).then((user) => {
+            req.log.info('user', user);
+            if(user) {
+                if(user.password == req.body.password) {
+                    res.json(user);
+                } else {
+                    res.status(404).send('incorrect password');
+                }
             } else {
-                res.status(404).send('SKU not found');
+                res.status(404).send('name not found');
             }
         }).catch((e) => {
             req.log.error('ERROR', e);
             res.status(500).send(e);
         });
-        }, delay);
     } else {
         req.log.error('database not available');
         res.status(500).send('database not available');
     }
 });
 
-// products in a category
-app.get('/products/:cat', (req, res) => {
-    if(mongoConnected) {
-        collection.find({ categories: req.params.cat }).sort({ name: 1 }).toArray().then((products) => {
-            if(products) {
-                res.json(products);
+// TODO - validate email address format
+app.post('/register', (req, res) => {
+    req.log.info('register', req.body);
+    if(req.body.name === undefined || req.body.password === undefined || req.body.email === undefined) {
+        req.log.warn('insufficient data');
+        res.status(400).send('insufficient data');
+    } else if(mongoConnected) {
+        // check if name already exists
+        usersCollection.findOne({name: req.body.name}).then((user) => {
+            if(user) {
+                req.log.warn('user already exists');
+                res.status(400).send('name already exists');
             } else {
-                res.status(404).send('No products for ' + req.params.cat);
+                // create new user
+                usersCollection.insertOne({
+                    name: req.body.name,
+                    password: req.body.password,
+                    email: req.body.email
+                }).then((r) => {
+                    req.log.info('inserted', r.result);
+                    res.send('OK');
+                }).catch((e) => {
+                    req.log.error('ERROR', e);
+                    res.status(500).send(e);
+                });
             }
         }).catch((e) => {
             req.log.error('ERROR', e);
@@ -94,17 +153,56 @@ app.get('/products/:cat', (req, res) => {
         });
     } else {
         req.log.error('database not available');
-        res.status(500).send('database not avaiable');
+        res.status(500).send('database not available');
     }
 });
 
-// all categories
-app.get('/categories', (req, res) => {
+app.post('/order/:id', (req, res) => {
+    req.log.info('order', req.body);
+    // only for registered users
     if(mongoConnected) {
-        collection.distinct('categories').then((categories) => {
-            res.json(categories);
+        usersCollection.findOne({
+            name: req.params.id
+        }).then((user) => {
+            if(user) {
+                // found user record
+                // get orders
+                ordersCollection.findOne({
+                    name: req.params.id
+                }).then((history) => {
+                    if(history) {
+                        var list = history.history;
+                        list.push(req.body);
+                        ordersCollection.updateOne(
+                            { name: req.params.id },
+                            { $set: { history: list }}
+                        ).then((r) => {
+                            res.send('OK');
+                        }).catch((e) => {
+                            req.log.error(e);
+                            res.status(500).send(e);
+                        });
+                    } else {
+                        // no history
+                        ordersCollection.insertOne({
+                            name: req.params.id,
+                            history: [ req.body ]
+                        }).then((r) => {
+                            res.send('OK');
+                        }).catch((e) => {
+                            req.log.error(e);
+                            res.status(500).send(e);
+                        });
+                    }
+                }).catch((e) => {
+                    req.log.error(e);
+                    res.status(500).send(e);
+                });
+            } else {
+                res.status(404).send('name not found');
+            }
         }).catch((e) => {
-            req.log.error('ERROR', e);
+            req.log.error(e);
             res.status(500).send(e);
         });
     } else {
@@ -113,32 +211,50 @@ app.get('/categories', (req, res) => {
     }
 });
 
-// search name and description
-app.get('/search/:text', (req, res) => {
+app.get('/history/:id', (req, res) => {
     if(mongoConnected) {
-        collection.find({ '$text': { '$search': req.params.text }}).toArray().then((hits) => {
-            res.json(hits);
+        ordersCollection.findOne({
+            name: req.params.id
+        }).then((history) => {
+            if(history) {
+                res.json(history);
+            } else {
+                res.status(404).send('history not found');
+            }
         }).catch((e) => {
-            req.log.error('ERROR', e);
+            req.log.error(e);
             res.status(500).send(e);
         });
     } else {
         req.log.error('database not available');
         res.status(500).send('database not available');
     }
+});
+
+// connect to Redis
+var redisClient = redis.createClient({
+    host: process.env.REDIS_HOST || 'redis'
+});
+
+redisClient.on('error', (e) => {
+    logger.error('Redis ERROR', e);
+});
+redisClient.on('ready', (r) => {
+    logger.info('Redis READY', r);
 });
 
 if (process.env.MONGO == 'true') {
 // set up Mongo
 function mongoConnect() {
     return new Promise((resolve, reject) => {
-        var mongoURL = process.env.MONGO_URL || 'mongodb://mongodb:27017/catalogue';
+        var mongoURL = process.env.MONGO_URL || 'mongodb://mongodb:27017/users';
         mongoClient.connect(mongoURL, (error, client) => {
             if(error) {
                 reject(error);
             } else {
-                db = client.db('catalogue');
-                collection = db.collection('products');
+                db = client.db('users');
+                usersCollection = db.collection('users');
+                ordersCollection = db.collection('orders');
                 resolve('connected');
             }
         });
@@ -149,19 +265,20 @@ function mongoConnect() {
 if (process.env.DOCUMENTDB == 'true') {
 function mongoConnect() {
     return new Promise((resolve, reject) => {
-    var mongoURL = process.env.MONGO_URL || 'mongodb://username:password@mongodb:27017/catalogue?tls=true&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false';
+    var mongoURL = process.env.MONGO_URL || 'mongodb://username:password@mongodb:27017/users?tls=true&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false';
     var client = mongoClient.connect(mongoURL,
       {
         // Mutable & Immutable
-        //tlsCAFile: `/home/roboshop/catalogue/rds-combined-ca-bundle.pem` //Specify the DocDB; cert
+        //tlsCAFile: `/home/roboshop/user/rds-combined-ca-bundle.pem` //Specify the DocDB; cert
         // Container
-        tlsCAFile: `/home/roboshop/catalogue/rds-combined-ca-bundle.pem` //Specify the DocDB; cert
+        tlsCAFile: `/home/roboshop/user/rds-combined-ca-bundle.pem` //Specify the DocDB; cert
     }, (error, client) => {
     if(error) {
         reject(error);
     } else {
-        db = client.db('catalogue');
-        collection = db.collection('products');
+        db = client.db('users');
+        usersCollection = db.collection('users');
+        ordersCollection = db.collection('orders');
         resolve('connected');
     }
 });
@@ -170,7 +287,7 @@ function mongoConnect() {
 }
 
 
-// mongodb connection retry loop
+
 function mongoLoop() {
     mongoConnect().then((r) => {
         mongoConnected = true;
@@ -184,10 +301,8 @@ function mongoLoop() {
 mongoLoop();
 
 // fire it up!
-const port = process.env.CATALOGUE_SERVER_PORT || '8080';
-const MONGO = process.env.MONGO || 'false';
-const DOCUMENTDB = process.env.DOCUMENTDB || 'false';
-
+const port = process.env.USER_SERVER_PORT || '8080';
 app.listen(port, () => {
     logger.info('Started on port', port);
 });
+
